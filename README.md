@@ -1,2 +1,4 @@
-# sph_fluid_simulation
-surface ocean water simulation based on a sum of sine functions approach to calculate a height map and get dynamically water surface orientation from GPU in a vertex shader.
+# SPH fluid simulation
+This is a basic water body simulation based on the Smoothed Particle Hydrodynamic (SPH) method with leapfrog integrator for simulate water fluids in 2D from CPU using JavaScript and ThreeJS. The code was originally written in c by the Computer Science professor David Bindel at Cornell University as a parallel computing class exercise.
+
+
