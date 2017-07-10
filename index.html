@@ -1,0 +1,680 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <title>SPH Simulation</title>
+    <meta charset="utf-8">
+    <style type="text/css">
+      body {
+          overflow:hidden;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="container"></div>
+  </body>
+
+  <script src="js/three.min.js"></script>
+  <script src="js/stats.min.js"></script>
+  <script src="js/OrbitControls.js"></script>
+
+  <script type="text/javascript" id="mainCode">
+  /*
+  TODO/NOTES: 
+    1. damp_reflect() cuando la simulacion este funcionando comprabar que la reflexion de la componente 'which' del vector posición no es necesaria
+    2. place_particle() hacer que el numero de particulas n sea parametrizable
+    3. compute_accel() las aceleraciones iniciales son gigantescas, revisar lineas 182 en caso de comportamientos extraños
+    4. definir limites circulares
+  */
+
+    // THREE CODE
+    var container, renderer, scene, camera, mesh,
+    start = Date.now(),
+    fov = 30; // field of view
+    var myUniforms = {}
+
+    /*
+    2 - SYSTEM PARAMETERS
+
+    The sim_param_t structure holds the parameters that describe the simulation. These parameters are filled in by the get_params function (described later).
+    */
+
+    var sim_param_t = {
+      nframes: 0, // number of frames
+      npframes: 0, // steps per frame
+      h: 0, // particle size
+      dt: 0.01, // timestep
+      rho0: 0, // reference density or initial density
+      k: 0, // bulk modulus
+      mu: 0, // viscosity
+      g: 9.8 // gravity strenght 
+    }
+
+    // int get_params(int argc, char** argv, sim_param_t* params);
+
+    /*
+    3 - SYSTEM STATE
+
+    The sim_state_t structure holds the information for the current state of the system and of the integration algorithm. The array x has length 2n, with x[2*i+0] and x[2*i+1] representing the x and y coordinates of the particle positions. The layout for v, vh, and a is similar, while rho only has one entry per particle.
+    
+    The alloc_state and free_state functions take care of storage for the local simulation state
+    */
+
+    var sim_state_t = {
+      n: 10, // number of particles
+      mass: 1, // particle mass
+      rho: [], // densities
+      x: [], // positions
+      vh: [], // velocity (half step)
+      v: [], // velocities (full step)
+      a: [] // accelerations
+    }
+
+    // sim_state_t* alloc_state(int n);
+    // void free_state(sim_state_t* s);
+
+    /*
+    3.1 - DENSITY COMPUTATIONS
+
+    We search for neighbors of node i by checking every particle, which is not very efficient. We do at least take advange of the symmetry of the update (i contributes to j in the same way that j contributes to i).
+    */
+
+    function compute_density(sim_state, sim_param)
+    {
+      var n = sim_state.n;
+
+      var x = sim_state.x;
+
+      var h = sim_param.h;
+      var h2 = h*h;
+      var h8 = (h2*h2)*(h2*h2);
+
+      var C = 4*sim_state.mass / (Math.PI*h8);
+
+      // necesario para inicialicar rho en un valor no indefinido
+      sim_state.rho = new Array(n);
+      sim_state.rho.fill(0);
+
+      for (let i = 0; i < n; i++)
+      {
+        // EDITOR: ¿Porq se pone esta linea?
+
+        sim_state.rho[i] += 4*sim_state.mass / (Math.PI*h2);
+        
+        for (let j = i + 1; j < n; j++)
+        {
+          var dx = x[2*i + 0] - x[2*j + 0]; // x_i - x_(i+1)
+          var dy = x[2*i + 1] - x[2*j + 1]; // y_i - y_(i+1)
+
+          var r2 = dx*dx + dy*dy; // distancia al cuadrado entre particulas
+
+          var z = h2 - r2;
+          if (z > 0)
+          {
+            var rho_ij = C*z*z*z; // formula de densidad
+            sim_state.rho[i] += rho_ij;
+            sim_state.rho[j] += rho_ij; 
+          }
+        }
+      }
+    }
+
+    /*
+    3.2 - COMPUTING FORCES
+
+    Like compute density, the compute_accel routine takes advantage of the symmetry of the interaction forces (f interact ij = −f interact ji) but it does a very expensive brute force search for neighbors.
+    */
+
+    function compute_accel(sim_state, sim_param)
+    {
+      // Unpack basic parameters
+      var h = sim_param.h;
+      var rho0 = sim_param.rho0;
+      var k = sim_param.k;
+      var mu = sim_param.mu;
+      var g = sim_param.g;
+      var mass = sim_state.mass;
+      var h2 = h*h;
+
+      // Unpack system state
+      var rho = sim_state.rho; // array of particle densities
+      var x = sim_state.x; // array of positions
+      var v = sim_state.v; // array of velocities
+      var n = sim_state.n; // number of particles
+      // float* restrict a = sim_state.a; 
+      // don't create a copy of accelerations array from sim_state because we need update the accelerations values here
+      // Compute density and color
+      compute_density(sim_state, sim_param);
+      //console.log(rho);
+
+      // Start with gravity and surface forces
+      for (let i = 0; i < n; i++)
+      {
+        sim_state.a[2*i + 0] = 0;
+        sim_state.a[2*i + 1] = -g;
+      }
+
+
+      // Constants for interaction term
+      //var C0 = mass / (Math.PI * (h2*h2));
+      var C0 = mass / Math.PI / (h2*h2);
+      var Cp = 15*k;
+      var Cv = -40*mu;
+      
+      // Now compute interaction forces
+      for (let i = 0; i < n; i++)
+      {
+        var rhoi = rho[i]; // densidad de la particula i
+        for (let j = i+1; j < n; j++)
+        {
+          var dx = x[2*i + 0] - x[2*j + 0]; // diferencia en el eje 'x' de la particula i con respecto a la particula vecina j
+          var dy = x[2*i + 1] - x[2*j + 1]; // diferencia en el eje 'y' de la particula i con respecto a la particula vecina j
+          var r2 = dx*dx + dy*dy; // distancia al cuadrado entre la particula i y la particula j
+
+          // si la distancia al cuadrado entre la particula 'i' y la particula 'j' es menor al radio de interaccion al cuadrado...
+          if (r2 < h2)
+          {
+            var rhoj = rho[j]; // densidad de la particula j
+            var q = Math.sqrt(r2)/h2; // distancia entre la particula 'i' y la particula 'j' dividida entre el radio de interaccion h
+            var u = 1 - q;
+
+            var w0 = C0*u / rhoi / rhoj;
+            var wp = w0 * Cp * (rhoi + rhoj - 2*rho0) * u / q;
+            var wv = w0 * Cv;
+
+            var dvx = v[2*i + 0] - v[2*j + 0]; // diferencia de velocidad en el eje 'x' de la particula i con respecto a la particula vecina j
+            var dvy = v[2*i + 1] - v[2*j + 1]; // diferencia de velocidad en el eje 'y' de la particula i con respecto a la particula vecina j
+
+            // se multiplica por un numero muy pequeño para equilibrar el valor real de la fuerza con el dominio computacional de la simulacion
+            sim_state.a[2*i + 0] += (wp*dx + wv*dvx) *.00003;
+            sim_state.a[2*i + 1] += (wp*dy + wv*dvy) *.00003;
+            sim_state.a[2*j + 0] -= (wp*dx + wv*dvx) *.00003;
+            sim_state.a[2*j + 1] -= (wp*dy + wv*dvy) *.00003;
+/*
+            sim_state.a[2*i + 0] += (wp*dx + wv*dvx);
+            sim_state.a[2*i + 1] += (wp*dy + wv*dvy);
+            sim_state.a[2*j + 0] -= (wp*dx + wv*dvx);
+            sim_state.a[2*j + 1] -= (wp*dy + wv*dvy);*/
+          }
+        }
+      }
+    }
+
+    /*
+    4 - LEAPFROG INTEGRATION
+
+    The leapfrog time integration scheme is frequently used in particle simulation algorithms because.
+
+      - It is explicit, which makes it easy to code.
+      - It is second-order accurate.
+      - It is symplectic, which means that it conserves certain properties of the continuous differential equation for Hamiltonian systems. In practice, this means that it tends to conserve energy where energy is supposed to be conserved, assuming the time step is short enough for stability.
+
+    Of course, our system is not Hamiltonian – viscosity is a form of damping, so the system loses energy. But we’ll stick with the leapfrog integration scheme anyhow.
+
+    The leapfrog time integration algorithm is named because the velocities are updated on half steps and the positions on integer steps; hence, the two leap over each other. After computing accelerations, one step takes the form
+
+      de forma general para cualquier tiempo t mayor o igual a 1.5 tenemos que la velocidad es:
+
+        v(t + 1/2) = v(t - 1/2) + a(t)*∆t
+
+        donde v(t - 1/2) = a(0)*∆t/2 cuando t = 1/2
+
+        en notacion de subindices se tiene que:
+        v_(i + 1/2) = v_(i - 1/2) + a_i*∆t
+
+        lo que se mostró anteriormente puede ser demostrado facilmente analizando un sistema con aceleracion constante donde se busca integrar la funcion de aceleración mediante metodos numericos de tal forma que la altura de cada rectangulo de aproximacion de area este dado por la funcion de aceleracion evaluada en el punto medio entre el tiempo t y el tiempo t + 1 es decir (t + [t + 1])/2 = t + 1/2 y el ancho este denotado por un timestep arbitrario o ∆t = sim_param_t.dt
+
+      Usando el mismo algoritmo de integracion tenemos que la integral de la velocidad (la posicion) esta dada por
+
+        x(t + 1) = x(t) + v(t + 1/2)*∆t
+
+        en notacion de subindices se tiene que:
+        x_(i + 1) = x_i + v_(i + 1/2)*∆t
+
+    This is straightforward enough, except for two minor points.
+
+      1. In order to compute the acceleration at time t, we need the velocity at time t. But leapfrog only computes velocities at half steps! So we cheat a little: when we compute the half-step velocity v_(i+1/2) (stored in vh), we simultaneously compute an approximate integer step velocity v_(i+1) (stored in v) by taking another half step using the acceleration a_i.
+
+      2. We don’t explicitly represent the boundary by fixed particles, so we need some way to enforce the boundary conditions. We take the simple approach of explicitly reflecting the particles using the reflect bc_routine discussed below.
+    */
+
+  /*  function leapfrog_step(sim_state, dt)
+    {
+      var a = sim_state.a;
+      var n = sim_state.n;
+      // float* restrict vh = s.vh;
+      // float* restrict v = s.v;
+      // float* restrict x = s.x;
+
+      for (let i = 0; i < 2*n; ++i)
+      {
+        // desde 0 hasta 1.5
+        // v(1 + 1/2) = v(1/2) + a(1) * ∆t
+        sim_state.vh[i] += a[i] * dt;
+        // desde 0 hasta 1.5 + 0.5
+        // v(2) = [v(1/2) + a(1) * ∆t] + a(1) * ∆t/2
+        // v(2) = v(1.5) + a(1) * ∆t/2
+        sim_state.v[i] = sim_state.vh[i] + a[i] * dt/2; 
+        // esta v se crea para luego actualizar la aceleracion
+
+        // desde 0 hasta 2
+        // x(2) = x(1) + a(1 + 1/2) * ∆t
+        // x ()
+        sim_state.x[i] += sim_state.vh[i] * dt;
+      }
+    }*/
+
+    function leapfrog_step(sim_state, dt)
+    {
+      var a = sim_state.a;
+      var n = sim_state.n;
+      // float* restrict vh = s.vh;
+      // float* restrict v = s.v;
+      // float* restrict x = s.x;
+
+      for (let i = 0; i < 2*n; ++i)
+      {
+        // la integral de la aceleracion desde 0 hasta 1.5
+        // v(1 + 1/2) = v(1/2) + a(1) * ∆t
+        sim_state.vh[i] += a[i] * dt;
+
+        // la integral de la aceleracion desde 0 hasta 1.5 + 0.5
+        // v(2) = [v(1/2) + a(1) * ∆t] + a(1) * ∆t/2
+        // v(2) = v(1.5) + a(1) * ∆t/2
+        sim_state.v[i] = sim_state.vh[i] + a[i] * dt/2; // esta v se crea para luego actualizar la aceleracion
+
+        // la integral de la velocidad desde 0 hasta 2
+        // x(2) = x(1) + a(1 + 1/2) * ∆t
+        // x ()
+        sim_state.x[i] += sim_state.vh[i] * dt;
+      }
+
+      reflect_bc(sim_state);
+    }
+
+    /*
+    At the first step, the leapfrog iteration only has the initial velocities v_0 , so we need to do something special.
+      
+      v_(1/2) = v_0 + a_0 * ∆t/2
+      
+      r_1 = r_0 + v_(1/2) * ∆t.
+    */
+
+    // calcula la integral de la aceleración entre el tiempo t = 0 y el tiempo t = 1/2 = 0.5
+    function leapfrog_start(sim_state, dt)
+    {
+      var a = sim_state.a;
+      var n = sim_state.n;
+      // float* restrict vh = s.vh;
+      // float* restrict v = s.v;
+      // float* restrict x = s.x;
+
+      for (let i = 0; i < 2*n; ++i)
+      {
+        // la integral de la aceleracion desde 0 hasta 0.5
+        // v(1/2) = v(0) + a(0) * ∆t/2
+        sim_state.vh[i] = sim_state.v[i] + a[i] * dt/2;
+
+        // v(1) = a(0) * ∆t : integra aceleracion usando algoritmo de euler (no tiene mayor importancia, solo para dar un valor a la velocidad en el intervalo de tiempo t [0, 0.5])
+        sim_state.v[i] += a[i] * dt;
+
+        // la integral de la velocidad desde 0 hasta 0.5
+        // x(1) = x(0) + v(1/2) * ∆t
+        sim_state.x[i] += sim_state.vh[i] * dt;
+      }
+
+      reflect_bc(sim_state);
+    }
+
+    /*
+    5 - REFLECTION BOUNDARY CONDITIONS
+    Our boundary condition corresponds to hitting an inelastic boundary with a specified coefficient of restitution less than one. When a particle hits a vertical barrier (which = 0) or a horizontal barrier (which = 1), we process it with damp_reflect. This reduces the total distance traveled based on the time since the collision reflected, damps the velocities, and reflects whatever solution components should be reflected.
+    */
+
+    // damp_reflect(int which, float barrier, float* x, float* v, float* vh)
+    function damp_reflect(which, barrier, i, sim_state)
+    {
+      // Coefficient of resitiution
+      var DAMP = 0.75;
+
+      // Ignore degenerate cases
+      if (sim_state.v[2*i + which] == 0)
+        return;
+
+      // Scale back the distance traveled based on time from collision
+      // Este es el tiempo que ha durado la colision
+      var tbounce = (sim_state.x[2*i + which] - barrier) / sim_state.v[2*i + which]; // t = d/v
+      sim_state.x[2*i + 0] -= sim_state.v[2*i + 0]*(1 - DAMP)*tbounce;
+      sim_state.x[2*i + 1] -= sim_state.v[2*i + 1]*(1 - DAMP)*tbounce;
+      // se esta calculando una distancia d = v*t y esta se multimplica por un coeficiente de restitución
+      // lo que se esta haciendo es calcular una distancia la cual se le resta a la posicion actual de la particula para obtener la siguiente posición
+
+      // Reflect the position and velocity
+      //sim_state.x[2*i + which] = 2*barrier - sim_state.x[2*i + which];
+      sim_state.x[2*i + which] = -sim_state.x[2*i + which] + 2*barrier;
+      sim_state.v[2*i + which] = -sim_state.v[2*i + which];
+      sim_state.vh[2*i + which] = -sim_state.vh[2*i + which];
+
+      // Damp the velocities
+      sim_state.v[2*i + 0] *= DAMP;
+      sim_state.v[2*i + 1] *= DAMP;
+      sim_state.vh[2*i + 0] *= DAMP;
+      sim_state.vh[2*i + 1] *= DAMP;
+    }
+
+    /*
+    For each particle, we need to check for reflections on each of the four walls of the computational domain.
+    */
+
+    function reflect_bc(sim_state)
+    {
+      // Boundaries of the computational domain
+      var XMIN = 0.0;
+      var XMAX = 1.0;
+      var YMIN = 0.0;
+      var YMAX = 1.0;
+
+      var n = sim_state.n;
+
+      for (let i = 0; i < n; i++) 
+      {
+        if (sim_state.x[2*i + 0] < XMIN) damp_reflect(0, XMIN, i, sim_state);
+        if (sim_state.x[2*i + 0] > XMAX) damp_reflect(0, XMAX, i, sim_state);
+        if (sim_state.x[2*i + 1] < YMIN) damp_reflect(1, YMIN, i, sim_state);
+        if (sim_state.x[2*i + 1] > YMAX) damp_reflect(1, YMAX, i, sim_state);
+      }
+    }
+
+    /*
+    6 - INITIALIZATION
+    We’ve hard coded the computational domain to a unit box, but we’d prefer to do something more flexible for the initial distribution of fluid. In particular, we define the initial geometry of the fluid in terms of an indicator function that is one for points in the domain occupied by fluid and zero elsewhere. A domain_fun_t is a pointer to an indicator for a domain, which is a function that takes two floats and returns 0 or 1. Two examples of indicator functions are a little box of fluid in the corner of the domain and a circular drop.
+    */
+
+    // typedef int (*domain_fun_t)(float, float); // esto permitira pasar funciones como argumentos
+
+    function box_indicator(x, y)
+    {
+      return (x < 0.5) && (y > 0.5);
+      //return (x < 25) && (y < 25);
+    }
+
+    function circ_indicator(x, y)
+    {
+      var dx = (x - 0.5);
+      var dy = (y - 0.4);
+      var r2 = dx*dx + dy*dy;
+      return (r2 < 0.25*0.25);
+    }
+
+    /*
+    The place_particles routine fills a region (indicated by the indicatef argument) with fluid particles. The fluid particles are placed at points inside the domain that lie on a regular mesh with cell sizes of h/1.3. This is close enough to allow the particles to overlap somewhat, but not too much.
+    */
+
+    // sim_state_t* place_particles(sim_param_t* param, domain_fun_t indicatef)
+    function place_particles(sim_state, sim_param, indicatef)
+    {
+      var h = sim_param.h;
+      var hh = h/1.3;
+      //var hh = h;
+/*
+      // Count mesh points that fall in indicated region.
+      var count = 0;
+      for (var x = 0; x < 1; x += hh)
+        for (var y = 0; y < 1; y += hh)
+          count += indicatef(x, y);
+*/
+      // Populate the particle data structure
+      var p = 0;
+      for (var x = 0; x < 1; x += hh) 
+      {
+        for (var y = 0; y < 1; y += hh) 
+        {
+          if (indicatef(x, y))
+          {
+            sim_state.x[2*p + 0] = x;
+            sim_state.x[2*p + 1] = y;
+            sim_state.v[2*p + 0] = 0;
+            sim_state.v[2*p + 1] = 0;
+            ++p;
+          }
+        }
+      }
+
+      // se le dice al sistema cuantas particulas va a tener
+      sim_state.n = p;
+
+    }
+
+    /*
+    The place particle routine determines the initial particle placement, but not the desired mass. We want the fluid in the initial configuration to exist roughly at the reference density. One way to do this is to take the volume in the indicated body of fluid, multiply by the mass density, and divide by the number of particles; but that requires that we be able to compute the volume of the fluid region. Alternately, we can simply compute the average mass density assuming each particle has mass one, then use that to compute the particle mass necessary in order to achieve the desired reference density. We do this with normalize_mass.
+    */
+
+    function normalize_mass(sim_state, sim_param)
+    {
+      sim_state.mass = 1;
+      compute_density(sim_state, sim_param);
+      var rho0 = sim_param.rho0;
+      var rho2s = 0;
+      var rhos = 0;
+
+      for (let i = 0; i < sim_state.n; i++) 
+      {
+        rho2s += (sim_state.rho[i]) * (sim_state.rho[i]);
+        rhos += sim_state.rho[i];
+      }/*
+      console.log(sim_state.mass * ( rho0*rhos / rho2s ));
+      console.log(sim_state.mass);
+      console.log(rho0);
+      console.log(rhos);
+      console.log(rho2s);*/
+      sim_state.mass = sim_state.mass * ( rho0*rhos / rho2s );
+
+    }
+
+    // sim_state_t* init_particles(sim_param_t* param)
+    function init_particles(sim_state, sim_param, indicatef)
+    {
+      // sim_state_t* s = place_particles(param, box_indicator);
+      place_particles(sim_state, sim_param, indicatef);
+      normalize_mass(sim_state, sim_param);
+    }
+
+    /*
+    8 - OPTION PROCESSING
+    default_params routine sets the default parameter values.
+    */
+    function default_params(sim_param)
+    {
+      sim_param.nframes = 400;
+      sim_param.npframes = 100;
+      sim_param.dt = 1e-4;
+      //sim_param.h = 5e-2;
+      sim_param.h = 4e-2;
+      //sim_param.h = 1;
+      sim_param.rho0 = 1000;
+      sim_param.k = 1e3;
+      sim_param.mu = 0.1;
+      sim_param.g = 9.8;
+    }
+
+    /*
+    VISAULIZATION
+    */
+
+    window.addEventListener( 'load', function() 
+    {
+      // grab the container from the DOM
+      container = document.getElementById( "container" );
+
+      // create a scene
+      scene = new THREE.Scene();
+
+      stats = new Stats();
+      container.appendChild( stats.dom );
+
+      // create a camera the size of the browser window
+      // and place it 100 units away, looking towards the center of the scene
+      /*
+      camera = new THREE.PerspectiveCamera(
+        fov, // fov — Camera frustum vertical field of view.
+        window.innerWidth / window.innerHeight, // aspect — Camera frustum aspect ratio.
+        1, // near — Camera frustum near plane.
+        10000 // far — Camera frustum far plane.
+      );
+      camera.position.z = 10;*/
+      var width = 1;
+      var height = 1;
+      camera = new THREE.OrthographicCamera( 
+        0, width, -height, 0, 1, 1000 );
+      camera.position.z = 100;
+      //scene.add( camera );
+      
+      // create a wireframe material
+      materialWireframe = new THREE.MeshBasicMaterial( {
+        color: 0xb7ff00,
+        wireframe: true
+      } );
+
+/*
+      cube = new THREE.Mesh(
+          new THREE.BoxGeometry( .1, .1, .1 ), 
+          materialWireframe
+      );
+      scene.add( cube );*/
+/*
+      cube = new THREE.Mesh(
+          new THREE.BoxGeometry( .1, .1, .1 ), 
+          materialWireframe
+      );
+      cube.position.x = 1;
+      cube.position.y = 0;
+      scene.add( cube );
+*/
+/*
+      // Cubo en la esquina superior derecha de la escena
+      cube = new THREE.Mesh(
+          new THREE.BoxGeometry( .1, .1, .1 ), 
+          materialWireframe
+      );
+      cube.position.x = 1;
+      cube.position.y = -1;
+      scene.add( cube );
+      */
+
+      // create the renderer and attach it to the DOM
+      renderer = new THREE.WebGLRenderer();
+      //renderer.setSize( window.innerWidth, window.innerHeight );
+      renderer.setSize( 700, 700 );
+      renderer.setPixelRatio( window.devicePixelRatio );
+
+      container.appendChild( renderer.domElement );
+
+      // Add OrbitControls so that we can pan around with the mouse.
+      controls = new THREE.OrbitControls(camera, renderer.domElement);
+
+      var axes = new THREE.AxisHelper(100);
+      scene.add( axes );
+
+      // SIMULATION CONFIGS
+      default_params(sim_param_t);
+      init_particles(sim_state_t, sim_param_t, circ_indicator);
+      nframes = sim_param_t.nframes;
+      npframe = sim_param_t.npframes;
+      var dt = sim_param_t.dt;
+      var n = sim_state_t.n;
+      compute_accel(sim_state_t, sim_param_t);
+      leapfrog_start(sim_state_t, dt);
+      frame = 1; // variable global para conocer el frame actual
+/*
+      // el for externo lo hará el request animation frame
+      for (let frame = 1; frame < nframes; ++frame) 
+      {
+        for (let i = 0; i < npframe; ++i) 
+        {
+          compute_accel(sim_state_t, sim_param_t);
+          leapfrog_step(sim_state_t, dt);
+        }
+      }
+*/
+      init_visualization_particles(sim_state_t);
+      //update_visualization_particles_pos(sim_state_t);
+      var s = sim_state_t.a.slice();
+      //console.log(s);
+      render();
+
+    });
+
+    function render() 
+    {
+      requestAnimationFrame( render );
+      stats.begin();
+
+      //if (frame > nframes) return;
+      let i = 0;
+      while(i < npframe)
+      {
+        compute_accel(sim_state_t, sim_param_t);
+        leapfrog_step(sim_state_t, sim_param_t.dt);
+        i++;
+      }
+      update_visualization_particles_pos(sim_state_t);
+      frame++;
+
+      //controls.update();
+      renderer.render( scene, camera );
+      stats.end();
+    }
+
+    function init_visualization_particles(sim_state)
+    {
+      particles = [];
+      for (var i = 0; i < sim_state.n; i++)
+      {
+        particles.push(new THREE.Mesh(
+          //new THREE.BoxGeometry( .1, .1, .1 ),
+          new THREE.BoxGeometry( sim_param_t.h, sim_param_t.h, .1 ), 
+          materialWireframe
+        ));
+        particles[i].position.x = sim_state.x[2*i + 0];
+        particles[i].position.y = -sim_state.x[2*i + 1];
+        scene.add(particles[i]);
+
+        /*particles[i].position.x = sim_state.x[2*i + 0];
+        particles[i].position.y = sim_state.x[2*i + 1];*/
+        // establecer posicion inicial de las particulas
+        // el factor del random se usa para q las particuals no empiecen tan juntas
+        /*
+        particles[i].position.x = xa + 1000* Math.random() * h/3;
+        particles[i].position.y = ya + 100* Math.random() * h/3;
+        // subir un poco las particulas
+        particles[i].position.y += 10;
+        scene.add(particles[i]);*/
+      }
+      console.log(particles.length);
+      //console.log(particles);
+    }
+
+    function update_visualization_particles_pos(sim_state)
+    {
+      for (var i = 0; i < sim_state.n; i++)
+      {
+        particles[i].position.x = sim_state.x[2*i + 0];
+        particles[i].position.y = -sim_state.x[2*i + 1];
+        /*
+        particles.push(new THREE.Mesh(
+          new THREE.BoxGeometry( 0.1, 0.1, 0.1 ), 
+          materialWireframe
+        ));*/
+        // establecer posicion inicial de las particulas
+        // el factor del random se usa para q las particuals no empiecen tan juntas
+        /*
+        particles[i].position.x = xa + 1000* Math.random() * h/3;
+        particles[i].position.y = ya + 100* Math.random() * h/3;
+        // subir un poco las particulas
+        particles[i].position.y += 10;
+        scene.add(particles[i]);*/
+      }
+    }
+  </script>
+
+</html>
